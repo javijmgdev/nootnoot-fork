@@ -18,6 +18,12 @@ pub mod resource;
 pub mod spill;
 pub mod structure;
 
+/// A hash of what this translator is built from: its sources, manifest and
+/// build script, the workspace's lock file, the compiler's version and the
+/// crate's features. Caches of translations key on it, so a changed
+/// translator never serves an old translation.
+pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
+
 pub use dxbc::{Container, FourCC, Part};
 pub use dxil::{DxilProgram, ShaderKind, XboxExtras};
 pub use native::{
