@@ -45,6 +45,15 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+/// What the run is (commit, settings), written with every report.
+static RUN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Names the run in every report of the crash log from now on: one line,
+/// such as the commit built from and the `VICTORY_*` settings.
+pub fn describe_run(line: String) {
+    let _ = RUN.set(line);
+}
+
 /// Also appends every unhandled-exception report and panic to `file`, so a
 /// crash can be read after the console is gone.
 pub fn log_crashes_to(file: std::path::PathBuf) {
@@ -78,7 +87,11 @@ fn append_to_log(text: &str) {
         .map_or(0, |d| d.as_secs());
     let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
     if let Ok(mut f) = opened {
-        let _ = write!(f, "unix time {now}, process {}\n{text}\n", std::process::id());
+        let _ = writeln!(f, "unix time {now}, process {}", std::process::id());
+        if let Some(run) = RUN.get() {
+            let _ = writeln!(f, "{run}");
+        }
+        let _ = writeln!(f, "{text}");
     }
 }
 

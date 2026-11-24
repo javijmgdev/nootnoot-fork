@@ -26,6 +26,15 @@ pub fn run(
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    // What a run is, to compare runs: the source and the settings.
+    let run_line = format!(
+        "victory {}, {}, game {hash}, settings {}",
+        env!("VICTORY_COMMIT"),
+        build_kind(),
+        settings(std::env::vars())
+    );
+    println!("victory        {} ({})", env!("VICTORY_COMMIT"), build_kind());
+    println!("settings       {}", settings(std::env::vars()));
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -108,6 +117,8 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    victory_loader::describe_run(run_line.clone());
+    note_run(&temp.with_file_name("runs.log"), &run_line);
     victory_hle::runtime::use_console_timers();
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
@@ -183,6 +194,44 @@ fn watch(base: usize, size: usize) {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     });
+}
+
+/// The `VICTORY_*` variables among `vars`, sorted, as `NAME=value` pairs
+/// ("none" without any): what changes a run besides the source.
+#[cfg(windows)]
+fn settings(vars: impl Iterator<Item = (String, String)>) -> String {
+    let mut set: Vec<String> = vars
+        .filter(|(k, _)| k.starts_with("VICTORY_"))
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    set.sort();
+    if set.is_empty() { "none".into() } else { set.join(" ") }
+}
+
+/// Which build this is: the diagnostics feature and debug assertions
+/// change what a run logs and how fast it goes.
+#[cfg(windows)]
+fn build_kind() -> &'static str {
+    match (cfg!(feature = "diagnostics"), cfg!(debug_assertions)) {
+        (true, true) => "diagnostics debug build",
+        (true, false) => "diagnostics build",
+        (false, true) => "debug build",
+        (false, false) => "release build",
+    }
+}
+
+/// Appends a line naming this run to `file`, next to the crash log: its
+/// crash reports carry the same process id.
+#[cfg(windows)]
+fn note_run(file: &Path, line: &str) {
+    use std::io::Write;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let opened = std::fs::OpenOptions::new().create(true).append(true).open(file);
+    if let Ok(mut f) = opened {
+        let _ = writeln!(f, "unix time {now}, process {}, {line}", std::process::id());
+    }
 }
 
 /// DLLs the host or our runtime provide are never taken from the title.
@@ -335,6 +384,32 @@ mod tests {
         });
         other.join().unwrap();
         assert_eq!(*order.lock().unwrap(), [1, 2]);
+    }
+
+    #[test]
+    fn settings_list_victory_variables_sorted() {
+        let vars = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|&(k, v)| (k.to_owned(), v.to_owned()))
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        assert_eq!(super::settings(vars(&[("PATH", "x")])), "none");
+        assert_eq!(
+            super::settings(vars(&[
+                ("VICTORY_RELAY", "1"),
+                ("RUST_LOG", "info"),
+                ("VICTORY_LATE_WAIT", "2"),
+            ])),
+            "VICTORY_LATE_WAIT=2 VICTORY_RELAY=1"
+        );
+    }
+
+    #[test]
+    fn the_commit_is_built_in() {
+        let commit = env!("VICTORY_COMMIT");
+        assert!(!commit.is_empty() && commit.contains(" ("), "{commit}");
     }
 }
 
