@@ -63,10 +63,14 @@ fn build() -> &'static [u8; 32] {
         .into_iter()
         .map(|name| (name.to_owned(), std::env::var_os(name)))
         .collect();
+        // The view heap's null slot differs by host GPU: a translation
+        // cached without the clamp must not be served.
+        crate::descriptor::host::probe_view_limit();
         key(
             victory_shader::SOURCE_HASH,
             ENCODING,
             limit,
+            victory_shader::emit::view_heap_limit(),
             victory_shader::emit::group_sync(),
             &settings,
             victory_shader::emit::shader_opt(),
@@ -81,6 +85,7 @@ fn key(
     translator: &str,
     encoding: &[u8],
     limit: u32,
+    view_limit: u32,
     group_sync: u8,
     // The switches that pick the form of a wave64 program: without them a
     // run with `VICTORY_WAVE_WIDE=0` was served the translations an earlier
@@ -92,6 +97,7 @@ fn key(
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
+    h.update(&view_limit.to_le_bytes());
     // Which group barriers wait is part of the translation too.
     h.update(&[group_sync]);
     for (name, value) in settings {
@@ -351,15 +357,16 @@ mod tests {
     #[test]
     fn the_key_changes_with_the_translator_and_settings_only() {
         let wide = |v: Option<&str>| vec![("VICTORY_WAVE_WIDE".to_owned(), v.map(Into::into))];
-        let base = key("a", b"enc", 7, 0, &wide(None), 1);
-        assert_eq!(base, key("a", b"enc", 7, 0, &wide(None), 1));
+        let base = key("a", b"enc", 7, 9, 0, &wide(None), 1);
+        assert_eq!(base, key("a", b"enc", 7, 9, 0, &wide(None), 1));
         for other in [
-            key("b", b"enc", 7, 0, &wide(None), 1),
-            key("a", b"enc2", 7, 0, &wide(None), 1),
-            key("a", b"enc", 8, 0, &wide(None), 1),
-            key("a", b"enc", 7, 1, &wide(None), 1),
-            key("a", b"enc", 7, 0, &wide(Some("1")), 1),
-            key("a", b"enc", 7, 0, &wide(None), 2),
+            key("b", b"enc", 7, 9, 0, &wide(None), 1),
+            key("a", b"enc2", 7, 9, 0, &wide(None), 1),
+            key("a", b"enc", 8, 9, 0, &wide(None), 1),
+            key("a", b"enc", 7, 10, 0, &wide(None), 1),
+            key("a", b"enc", 7, 9, 1, &wide(None), 1),
+            key("a", b"enc", 7, 9, 0, &wide(Some("1")), 1),
+            key("a", b"enc", 7, 9, 0, &wide(None), 2),
         ] {
             assert_ne!(base, other);
         }
