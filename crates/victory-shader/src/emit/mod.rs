@@ -577,11 +577,22 @@ fn emit_program(
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
     let mut outputs = sig(FourCC::OSG1)?;
-    // Interpolation as DXC declares it by default; pixel inputs that are
-    // read get the mode their barycentrics say.
+    // Interpolation as the console container's PSV0 declares it, falling back
+    // to DXC's defaults when no PSV0 is present; pixel inputs that are read
+    // also get the mode their barycentrics say.
+    let psv_modes = c
+        .part(FourCC::PSV0)
+        .and_then(|p| psv_interps(p.data, pixel));
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated {
-        e.interp = match (e.kind, e.comp) {
+        let from_psv = psv_modes.as_ref().and_then(|m| {
+            let key = match e.row {
+                Some(r) => (true, r, e.col, 0),
+                None => (false, 0, 0, e.kind),
+            };
+            m.get(&key).copied().filter(|&mode| mode != 0)
+        });
+        e.interp = from_psv.unwrap_or(match (e.kind, e.comp) {
             (3, _) => 4,
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
@@ -591,13 +602,15 @@ fn emit_program(
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
-        };
+        });
     }
     // With a conservative depth output (SV_DepthLessEqual, GreaterEqual) DXIL
     // wants the position centroid (or per sample), as DXC declares it then.
     if pixel && outputs.iter().any(|e| matches!(e.kind, 18 | 19)) {
         for e in inputs.iter_mut().filter(|e| e.kind == 3) {
-            e.interp = 5;
+            if !matches!(e.interp, 5 | 7) {
+                e.interp = 5;
+            }
         }
     }
     // Per-primitive outputs are constant. The console never exports a
@@ -660,6 +673,57 @@ fn emit_program(
         root_indexed_views: res.root_indexed_views.clone(),
     };
     Ok((shader, wave_size))
+}
+
+/// Per-element interpolation modes from a console container's `PSV0` part,
+/// keyed by `(allocated, row, col, unallocated_kind)`.
+fn psv_interps(
+    d: &[u8],
+    inputs: bool,
+) -> Option<std::collections::HashMap<(bool, u32, u8, u8), u8>> {
+    use crate::dxbc::u32_at;
+    let info_sz = u32_at(d, 0).ok()? as usize;
+    if info_sz < 36 || 4 + info_sz > d.len() {
+        return None;
+    }
+    let in_el = usize::from(*d.get(4 + 28)?);
+    let out_el = usize::from(*d.get(4 + 29)?);
+    let mut pos = 4 + info_sz;
+    let res_cnt = u32_at(d, pos).ok()? as usize;
+    pos += 4;
+    if res_cnt > 0 {
+        let res_sz = u32_at(d, pos).ok()? as usize;
+        pos = pos.checked_add(4)?.checked_add(res_cnt.checked_mul(res_sz)?)?;
+    }
+    let str_len = u32_at(d, pos).ok()? as usize;
+    pos = pos.checked_add(4)?.checked_add(str_len)?;
+    let idx_cnt = u32_at(d, pos).ok()? as usize;
+    pos = pos.checked_add(4)?.checked_add(idx_cnt.checked_mul(4)?)?;
+    if pos >= d.len() {
+        return Some(std::collections::HashMap::new());
+    }
+    let el_sz = u32_at(d, pos).ok()? as usize;
+    pos += 4;
+    if el_sz < 14 {
+        return None;
+    }
+    let (start, count) = if inputs { (0, in_el) } else { (in_el, out_el) };
+    let end = start.checked_add(count)?;
+    if pos.checked_add(end.checked_mul(el_sz)?)? > d.len() {
+        return None;
+    }
+    let mut out = std::collections::HashMap::with_capacity(count);
+    for k in start..end {
+        let e = &d[pos + k * el_sz..pos + (k + 1) * el_sz];
+        let alloc = e[10] >> 6 & 1 != 0;
+        let key = if alloc {
+            (true, u32::from(e[9]), (e[10] >> 4) & 3, 0)
+        } else {
+            (false, 0, 0, e[11])
+        };
+        out.insert(key, e[13]);
+    }
+    Some(out)
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -1764,5 +1828,112 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+
+    #[test]
+    fn console_psv_interpolation_modes_are_preserved_for_copacked_inputs() {
+        // A float input co-packed in row 0 alongside a uint input must keep
+        // the console PSV0's Constant (1) mode instead of defaulting to Linear
+        // (2), which DXIL validator 1.6 rejects when mixed in one register.
+        let words = [
+            0xC80E_0000u32, // v_interp_mov_f32 v0, p0, attr0.x
+            0xF800_180F,
+            0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+            0xBF81_0000,
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![crate::native::PsInput {
+                    usage: crate::native::Usage::Generic,
+                    row: 0,
+                    mask: 0b11,
+                    attr: 0,
+                    flat: true,
+                    fp16: false,
+                    pack2: false,
+                    row2: 0,
+                }],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let f_flat = SigElement {
+            name: "TEXCOORD".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 1,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let u_flat = SigElement {
+            name: "TEXCOORD".into(),
+            index: 1,
+            kind: 0,
+            comp: 5,
+            interp: 1,
+            row: Some(0),
+            col: 1,
+            cols: 1,
+            usage: 0,
+            half: false,
+        };
+        let target = SigElement {
+            name: "SV_Target".into(),
+            index: 0,
+            kind: 16,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        let isg1 = super::container::signature(&[f_flat.clone(), u_flat.clone()], true);
+        let osg1 = super::container::signature(std::slice::from_ref(&target), false);
+        let psv0 = super::container::psv(&super::container::Psv {
+            stage: 0,
+            flag: false,
+            inputs: &[f_flat, u_flat],
+            outputs: &[target],
+            prims: &[],
+            mesh: None,
+            bindings: &[],
+            threads: [0; 3],
+            wave_size: None,
+            geometry: None,
+        });
+        let bytes = crate::dxbc::build(&[
+            (super::FourCC::ISG1, &isg1),
+            (super::FourCC::OSG1, &osg1),
+            (super::FourCC::PSV0, &psv0),
+        ]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let host = super::Container::parse(&out.dxil).unwrap();
+        let modes = super::psv_interps(host.part(super::FourCC::PSV0).unwrap().data, true).unwrap();
+        assert_eq!(modes.get(&(true, 0, 0, 0)), Some(&1));
+        assert_eq!(modes.get(&(true, 0, 1, 0)), Some(&1));
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
     }
 }
