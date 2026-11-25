@@ -725,22 +725,14 @@ impl State {
             0 => None,
             h => crate::descriptor::heap(h as This).host(),
         }?;
-        let builder = crate::pipeline::is_builder(self.pipeline as This);
         let (mut addresses, mut constants) = (Vec::new(), Vec::new());
         for root in self.roots_ref(compute) {
             match root {
                 Root::View(address) => addresses.push(*address),
-                // Only the structure builder passes structures in constants;
-                // elsewhere what looks like an address is mostly not one, and
-                // each took a numbered copy.
-                Root::Constants(values) if builder => constants.extend_from_slice(values),
+                Root::Constants(values) => constants.extend_from_slice(values),
                 _ => {}
             }
         }
-        // The programs that walk the structures only load by address: they
-        // must not declare every copy written (the builder's quarantine, and
-        // the cost of comparing them all).
-        let writes = writes && builder;
         crate::memory::ready(list, heap, &addresses, &constants, writes)
     }
 
