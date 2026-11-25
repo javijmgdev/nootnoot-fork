@@ -840,6 +840,8 @@ extern "system" fn present(
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
     }
+    #[cfg(windows)]
+    crate::pipeline::frame_drew(crate::draw::drawn());
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     S_OK

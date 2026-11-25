@@ -292,6 +292,19 @@ fn next() -> Arc<Pending> {
     }
 }
 
+/// Workers at work until the title draws a world.
+const MENU_WORKERS: usize = 2;
+static WORLD: AtomicBool = AtomicBool::new(false);
+
+/// At every present, with the draws run on the host so far: a frame of many
+/// draws is the world's (menus run about ten).
+pub(crate) fn frame_drew(drawn: u64) {
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if drawn.saturating_sub(LAST.swap(drawn, Ordering::Relaxed)) >= 60 {
+        WORLD.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
@@ -301,7 +314,7 @@ fn workers() -> bool {
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
-                .spawn(|| {
+                .spawn(move || {
                     // Below the title's own threads (loading, recording).
                     // SAFETY: a plain call on our own thread.
                     unsafe {
@@ -309,6 +322,11 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
+                        // All of them during the intro and the menus starve
+                        // the title's threads: frames come unevenly.
+                        while i >= MENU_WORKERS && !WORLD.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
                         next().make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
